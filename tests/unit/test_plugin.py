@@ -57,7 +57,9 @@ class TestTikTokPluginAttributes:
         assert TikTokPlugin().name == "tiktok"
 
     def test_version(self) -> None:
-        assert TikTokPlugin().version == "0.2.0"
+        from reeln_tiktok_plugin import __version__
+
+        assert TikTokPlugin().version == __version__
 
     def test_api_version(self) -> None:
         assert TikTokPlugin().api_version == 1
