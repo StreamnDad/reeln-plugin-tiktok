@@ -24,7 +24,7 @@ class TikTokPlugin:
     """Plugin that provides TikTok upload integration for reeln-cli."""
 
     name: str = "tiktok"
-    version: str = "0.3.0"
+    version: str = "0.4.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
