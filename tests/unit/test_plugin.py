@@ -1104,7 +1104,7 @@ class TestUpload:
         missing = tmp_path / "nonexistent.mp4"
         plugin = TikTokPlugin(plugin_config)
 
-        with pytest.raises(FileNotFoundError, match="nonexistent.mp4"):
+        with pytest.raises(FileNotFoundError, match=r"nonexistent\.mp4"):
             plugin.upload(missing, metadata={"format": "1080x1920"})
 
     def test_upload_auth_failure_raises_runtime_error(
@@ -1117,9 +1117,8 @@ class TestUpload:
         with patch(
             "reeln_tiktok_plugin.plugin.auth.load_credentials",
             side_effect=AuthError("bad token"),
-        ):
-            with pytest.raises(RuntimeError, match="authentication"):
-                plugin.upload(video_file, metadata={"format": "1080x1920"})
+        ), pytest.raises(RuntimeError, match="authentication"):
+            plugin.upload(video_file, metadata={"format": "1080x1920"})
 
     def test_upload_duration_exceeds_max_raises_skipped(
         self,
@@ -1135,15 +1134,14 @@ class TestUpload:
         with patch(
             "reeln_tiktok_plugin.plugin.upload.query_creator_info",
             return_value=_CREATOR,
-        ):
-            with pytest.raises(UploaderSkipped, match="exceeds"):
-                plugin.upload(
-                    video_file,
-                    metadata={
-                        "format": "1080x1920",
-                        "duration_seconds": 9999.0,
-                    },
-                )
+        ), pytest.raises(UploaderSkipped, match="exceeds"):
+            plugin.upload(
+                video_file,
+                metadata={
+                    "format": "1080x1920",
+                    "duration_seconds": 9999.0,
+                },
+            )
 
     def test_upload_dry_run_returns_sentinel(
         self,
