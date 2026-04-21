@@ -10,10 +10,12 @@ from typing import Any
 
 from reeln.models.auth import AuthCheckResult, AuthStatus
 from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
+from reeln.plugins.capabilities import UploaderSkipped
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
 from reeln_tiktok_plugin import auth, upload
+from reeln_tiktok_plugin.upload import CreatorInfo
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -148,7 +150,10 @@ class TikTokPlugin:
         self._config: dict[str, Any] = config or {}
         self._access_token: str | None = None
         self._game_info: object | None = None
-        self._creator_info: upload.CreatorInfo | None = None
+        self._creator_info: CreatorInfo | None = None
+        # Most recent upload result, captured by upload() for
+        # on_post_render to populate context.shared["uploads"].
+        self._last_upload_result: upload.UploadResult | None = None
 
     def register(self, registry: HookRegistry) -> None:
         """Register hook handlers with the reeln plugin registry."""
@@ -162,97 +167,92 @@ class TikTokPlugin:
 
     def on_game_init(self, context: HookContext) -> None:
         """Handle ``ON_GAME_INIT`` — cache game info for template rendering."""
+        if context.data.get("regenerate_image_only", False):
+            return
+
         game_info = context.data.get("game_info")
         if game_info is None:
             log.warning("TikTok plugin: no game_info in context, skipping")
             return
         self._game_info = game_info
 
-    def on_post_render(self, context: HookContext) -> None:
-        """Handle ``POST_RENDER`` — upload rendered video to TikTok.
+    def upload(
+        self, path: Path, *, metadata: dict[str, Any] | None = None
+    ) -> str:
+        """Upload a rendered video to TikTok and return its share URL.
 
-        Detects portrait (Short) vs landscape from plan dimensions and
-        checks the appropriate feature flag before uploading.  Uses
-        ``PULL_FROM_URL`` when ``context.shared["video_url"]`` is
-        available (e.g. from the Cloudflare plugin), otherwise falls
-        back to ``FILE_UPLOAD`` with chunked PUT.
+        Implements the :class:`reeln.plugins.capabilities.Uploader` protocol
+        so the plugin can be used by ``reeln queue publish`` for truthful
+        per-target status reporting.
+
+        Detects portrait (Short) vs landscape from ``metadata["format"]``
+        (e.g. ``"1080x1920"``) and gates on ``upload_shorts`` or
+        ``upload_videos`` accordingly. Uses the TikTok ``PULL_FROM_URL``
+        upload flow when ``metadata["video_url"]`` is populated (by
+        cloudflare), otherwise falls back to chunked ``FILE_UPLOAD``.
+
+        Raises:
+            UploaderSkipped: when the relevant feature flag is disabled,
+                or the video duration exceeds the creator's max (direct_post).
+            FileNotFoundError: when the source file does not exist.
+            RuntimeError: when authentication fails.
+            reeln_tiktok_plugin.upload.UploadError: on upload failure.
         """
+        meta = metadata or {}
+
+        is_portrait = self._is_portrait_from_metadata(meta)
         want_shorts = self._config.get("upload_shorts", False)
         want_videos = self._config.get("upload_videos", False)
-        if not want_shorts and not want_videos:
-            return
-
-        plan = context.data.get("plan")
-        result = context.data.get("result")
-        if plan is None or result is None:
-            return
-
-        if getattr(plan, "filter_complex", None) is None:
-            return
-
-        plan_width = getattr(plan, "width", None)
-        plan_height = getattr(plan, "height", None)
-        is_portrait = (
-            plan_width is not None
-            and plan_height is not None
-            and plan_width < plan_height
-        )
-
         if is_portrait and not want_shorts:
-            return
+            raise UploaderSkipped(
+                "upload_shorts disabled in tiktok plugin config"
+            )
         if not is_portrait and not want_videos:
-            return
+            raise UploaderSkipped(
+                "upload_videos disabled in tiktok plugin config"
+            )
 
-        output = getattr(result, "output", None)
-        if output is None or not Path(output).exists():
-            log.warning("TikTok plugin: render output missing or not found, skipping")
-            return
-
-        # Cache game_info from hook data if not already set
-        if self._game_info is None:
-            hook_game_info = context.data.get("game_info")
-            if hook_game_info is not None:
-                self._game_info = hook_game_info
+        if not path.exists():
+            raise FileNotFoundError(f"TikTok upload source not found: {path}")
 
         access_token = self._ensure_auth()
         if access_token is None:
-            return
+            raise RuntimeError(
+                "TikTok plugin: authentication failed "
+                "(check client_key/client_secret and OAuth credentials)"
+            )
 
-        # Pre-flight: query creator info for validation (direct_post only —
-        # requires video.publish scope which inbox/drafts mode doesn't have)
+        # Pre-flight creator info check for direct_post (video.publish scope).
         privacy_level = self._config.get("privacy_level", "SELF_ONLY")
         if self._config.get("direct_post", False):
             creator = self._ensure_creator_info(access_token)
             if creator is not None:
                 privacy_level = self._validate_privacy(privacy_level, creator)
-                duration = getattr(result, "duration_seconds", None)
+                duration = meta.get("duration_seconds")
                 if (
                     duration is not None
                     and creator.max_video_post_duration_sec > 0
                     and float(duration) > creator.max_video_post_duration_sec
                 ):
-                    log.warning(
-                        "TikTok plugin: video duration %.1fs exceeds creator max %ds, skipping",
-                        float(duration),
-                        creator.max_video_post_duration_sec,
+                    raise UploaderSkipped(
+                        f"video duration {float(duration):.1f}s exceeds "
+                        f"tiktok creator max {creator.max_video_post_duration_sec}s"
                     )
-                    return
 
-        metadata = self._resolve_render_metadata(context)
-        caption = metadata["caption"]
+        caption = self._build_caption_from_metadata(meta)
+        video_url = str(meta.get("video_url", ""))
 
         if self._config.get("dry_run"):
             log.info(
                 "TikTok plugin: [DRY RUN] would upload video — "
                 "file=%s, caption=%r, direct_post=%s, privacy=%s",
-                output,
+                path,
                 caption,
                 self._config.get("direct_post", False),
                 privacy_level,
             )
-            return
+            return "tiktok:dry_run"
 
-        video_url = context.shared.get("video_url", "")
         common_kwargs: dict[str, Any] = {
             "access_token": access_token,
             "caption": caption,
@@ -269,22 +269,160 @@ class TikTokPlugin:
             "max_attempts": self._config.get("upload_poll_max_attempts", 60),
         }
 
+        if video_url:
+            upload_result = upload.upload_video_from_url(
+                video_url=video_url,
+                **common_kwargs,
+            )
+        else:
+            upload_result = upload.upload_video(
+                file_path=path,
+                chunk_size_bytes=self._config.get("chunk_size_bytes", 10485760),
+                **common_kwargs,
+            )
+
+        self._last_upload_result = upload_result
+        log.info(
+            "TikTok plugin: uploaded publish_id=%s status=%s",
+            upload_result.publish_id,
+            upload_result.status,
+        )
+        return upload_result.share_url or f"tiktok:{upload_result.publish_id}"
+
+    @staticmethod
+    def _is_portrait_from_metadata(metadata: dict[str, Any]) -> bool:
+        """Detect portrait orientation from a ``"WxH"`` format string."""
+        fmt = metadata.get("format", "")
+        if not isinstance(fmt, str) or "x" not in fmt:
+            return False
         try:
-            if video_url:
-                upload_result = upload.upload_video_from_url(
-                    video_url=video_url,
-                    **common_kwargs,
-                )
-            else:
-                upload_result = upload.upload_video(
-                    file_path=Path(output),
-                    chunk_size_bytes=self._config.get("chunk_size_bytes", 10485760),
-                    **common_kwargs,
-                )
-        except upload.UploadError as exc:
-            log.warning("TikTok plugin: upload failed: %s", exc)
+            width_str, height_str = fmt.split("x", 1)
+            return int(width_str) < int(height_str)
+        except (ValueError, TypeError):
+            return False
+
+    def _build_caption_from_metadata(self, metadata: dict[str, Any]) -> str:
+        """Build the TikTok caption from metadata/template/game_info.
+
+        Mirrors :meth:`_resolve_render_metadata` but reads the description
+        directly from the metadata dict instead of ``context.shared``.
+        """
+        description = str(metadata.get("description", ""))
+        if description:
+            return description
+
+        template = self._config.get("caption_template", "")
+        if template:
+            # Hydrate game_info from metadata for template rendering if needed.
+            self._hydrate_game_info_from_metadata(metadata)
+            return self._render_template(template)
+
+        if self._game_info is not None:
+            return self._build_title(self._game_info)
+
+        # Last resort: hydrate from metadata and build a title.
+        self._hydrate_game_info_from_metadata(metadata)
+        if self._game_info is not None:
+            return self._build_title(self._game_info)
+        return ""
+
+    def _hydrate_game_info_from_metadata(
+        self, metadata: dict[str, Any]
+    ) -> None:
+        """Populate ``self._game_info`` from a publish metadata dict.
+
+        The manual publish path instantiates plugins fresh, so
+        ``_game_info`` is None and template rendering would otherwise
+        produce empty strings. This builds a minimal stand-in with the
+        attributes templates and titles actually use.
+        """
+        if self._game_info is not None:
+            return
+        if not metadata:
             return
 
+        class _MetaGameInfo:
+            def __init__(self, **kwargs: Any) -> None:
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        self._game_info = _MetaGameInfo(
+            home_team=str(metadata.get("home_team", "")),
+            away_team=str(metadata.get("away_team", "")),
+            date=str(metadata.get("date", "")),
+            venue="",
+            sport=str(metadata.get("sport", "")),
+        )
+
+    def on_post_render(self, context: HookContext) -> None:
+        """Handle ``POST_RENDER`` — delegate to :meth:`upload`.
+
+        Preserves the auto-publish-during-render contract: exceptions
+        are swallowed (a TikTok failure must never break the render
+        pipeline) and the upload record is written into
+        ``context.shared["uploads"]["tiktok"]`` on success.
+        """
+        plan = context.data.get("plan")
+        result = context.data.get("result")
+        if plan is None or result is None:
+            return
+
+        if getattr(plan, "filter_complex", None) is None:
+            return
+
+        output = getattr(result, "output", None)
+        if output is None or not Path(output).exists():
+            log.warning(
+                "TikTok plugin: render output missing or not found, skipping"
+            )
+            return
+
+        # Cache game_info from hook data if not already set.
+        if self._game_info is None:
+            hook_game_info = context.data.get("game_info")
+            if hook_game_info is not None:
+                self._game_info = hook_game_info
+
+        # Build metadata dict from hook data for the delegated call.
+        plan_width = getattr(plan, "width", None)
+        plan_height = getattr(plan, "height", None)
+        format_str = (
+            f"{plan_width}x{plan_height}"
+            if plan_width is not None and plan_height is not None
+            else ""
+        )
+        render_meta = self._resolve_render_metadata(context)
+        metadata: dict[str, Any] = {
+            "description": render_meta.get("caption", ""),
+        }
+        if format_str:
+            metadata["format"] = format_str
+        duration = getattr(result, "duration_seconds", None)
+        if duration is not None:
+            metadata["duration_seconds"] = duration
+        video_url = context.shared.get("video_url", "")
+        if video_url:
+            metadata["video_url"] = str(video_url)
+
+        try:
+            self.upload(Path(output), metadata=metadata)
+        except UploaderSkipped as exc:
+            log.info("TikTok plugin: %s", exc)
+            return
+        except Exception as exc:
+            log.warning("TikTok plugin: upload failed (non-fatal): %s", exc)
+            return
+
+        # Persist upload record into shared context for downstream plugins
+        # (matches legacy behavior).
+        upload_result = getattr(self, "_last_upload_result", None)
+        if upload_result is None:
+            return
+        is_portrait = (
+            plan_width is not None
+            and plan_height is not None
+            and plan_width < plan_height
+        )
         upload_key = "shorts" if is_portrait else "videos"
         context.shared["uploads"] = context.shared.get("uploads", {})
         tiktok = context.shared["uploads"].setdefault("tiktok", {})
@@ -294,12 +432,6 @@ class TikTokPlugin:
                 "share_url": upload_result.share_url,
                 "status": upload_result.status,
             }
-        )
-        log.info(
-            "TikTok plugin: uploaded %s publish_id=%s status=%s",
-            upload_key.rstrip("s"),
-            upload_result.publish_id,
-            upload_result.status,
         )
 
     def on_game_finish(self, context: HookContext) -> None:
@@ -496,7 +628,7 @@ class TikTokPlugin:
 
         return self._access_token
 
-    def _ensure_creator_info(self, access_token: str) -> upload.CreatorInfo | None:
+    def _ensure_creator_info(self, access_token: str) -> CreatorInfo | None:
         """Return cached creator info, or query and cache it.
 
         Failures are non-fatal — returns ``None`` and logs a warning.
@@ -512,7 +644,7 @@ class TikTokPlugin:
 
         return self._creator_info
 
-    def _validate_privacy(self, privacy_level: str, creator: upload.CreatorInfo) -> str:
+    def _validate_privacy(self, privacy_level: str, creator: CreatorInfo) -> str:
         """Validate the configured privacy level against creator options.
 
         Falls back to the first available option if the configured level

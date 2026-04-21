@@ -127,6 +127,16 @@ class TestRegister:
 
 
 class TestOnGameInit:
+    def test_regenerate_image_only_skips(self) -> None:
+        """When regenerate_image_only is set, on_game_init returns immediately."""
+        plugin = TikTokPlugin()
+        context = HookContext(
+            hook=Hook.ON_GAME_INIT,
+            data={"game_info": FakeGameInfo(), "regenerate_image_only": True},
+        )
+        plugin.on_game_init(context)
+        assert plugin._game_info is None
+
     def test_caches_game_info(self) -> None:
         plugin = TikTokPlugin()
         gi = FakeGameInfo()
@@ -346,6 +356,24 @@ class TestOnPostRenderSuccess:
         assert context.shared["uploads"]["tiktok"]["shorts"] == [
             {"publish_id": "pub1", "share_url": "", "status": "SEND_TO_USER_INBOX"}
         ]
+
+    def test_upload_without_plan_dimensions(
+        self, plugin_config: dict[str, Any], video_file: Path
+    ) -> None:
+        """When plan has no width/height, format key is omitted from metadata."""
+        plugin_config["upload_videos"] = True
+        plugin = TikTokPlugin(plugin_config)
+        data: dict[str, Any] = {
+            "plan": FakePlan(width=None, height=None, output=video_file, filter_complex="overlay"),
+            "result": FakeResult(output=video_file),
+        }
+        context = HookContext(hook=Hook.POST_RENDER, data=data)
+        with patch(
+            "reeln_tiktok_plugin.plugin.upload.upload_video",
+            return_value=_UPLOAD_RESULT,
+        ):
+            plugin.on_post_render(context)
+        assert "videos" in context.shared["uploads"]["tiktok"]
 
     def test_landscape_upload_writes_videos(self, video_file: Path, plugin_config: dict[str, Any]) -> None:
         plugin_config["upload_videos"] = True
@@ -716,10 +744,12 @@ class TestDurationValidation:
         )
         with (
             patch("reeln_tiktok_plugin.plugin.upload.query_creator_info", return_value=_CREATOR),
-            caplog.at_level(logging.WARNING),
+            caplog.at_level(logging.INFO),
         ):
             plugin.on_post_render(context)
-        assert "exceeds creator max" in caplog.text
+        # upload() raises UploaderSkipped for over-limit duration; the
+        # on_post_render wrapper catches it and logs at INFO level.
+        assert "exceeds" in caplog.text
         assert "uploads" not in context.shared
 
     def test_duration_within_limit_uploads(
@@ -1044,3 +1074,353 @@ class TestAuthRefresh:
         # Cached state was cleared before auth_check
         assert plugin._access_token is None
         assert plugin._creator_info is None
+
+
+# ------------------------------------------------------------------
+# upload() — Uploader protocol for manual publish (reeln queue publish)
+# ------------------------------------------------------------------
+
+
+_CDN_URL = "https://cdn.example.com/clip.mp4"
+_SUCCESS_RESULT = UploadResult(
+    publish_id="pub-success",
+    status="PUBLISH_COMPLETE",
+    share_url="https://www.tiktok.com/@user/video/123",
+)
+
+
+class TestUpload:
+    """Tests for the ``upload()`` method used by ``reeln queue publish``.
+
+    TikTok detects portrait/landscape from ``metadata["format"]`` and
+    gates on ``upload_shorts``/``upload_videos``. Uses PULL_FROM_URL when
+    ``metadata["video_url"]`` is populated (typically by cloudflare),
+    else chunked FILE_UPLOAD.
+    """
+
+    def test_upload_shorts_disabled_raises_skipped(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        plugin_config.pop("upload_shorts", None)
+        plugin = TikTokPlugin(plugin_config)
+
+        with pytest.raises(UploaderSkipped, match="upload_shorts"):
+            plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+    def test_upload_videos_disabled_raises_skipped(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        # landscape → upload_videos required
+        plugin = TikTokPlugin(plugin_config)
+
+        with pytest.raises(UploaderSkipped, match="upload_videos"):
+            plugin.upload(video_file, metadata={"format": "1920x1080"})
+
+    def test_upload_missing_source_raises_file_not_found(
+        self,
+        plugin_config: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        missing = tmp_path / "nonexistent.mp4"
+        plugin = TikTokPlugin(plugin_config)
+
+        with pytest.raises(FileNotFoundError, match=r"nonexistent\.mp4"):
+            plugin.upload(missing, metadata={"format": "1080x1920"})
+
+    def test_upload_auth_failure_raises_runtime_error(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        plugin = TikTokPlugin(plugin_config)
+
+        with patch(
+            "reeln_tiktok_plugin.plugin.auth.load_credentials",
+            side_effect=AuthError("bad token"),
+        ), pytest.raises(RuntimeError, match="authentication"):
+            plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+    def test_upload_duration_exceeds_max_raises_skipped(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        plugin_config["direct_post"] = True
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        with patch(
+            "reeln_tiktok_plugin.plugin.upload.query_creator_info",
+            return_value=_CREATOR,
+        ), pytest.raises(UploaderSkipped, match="exceeds"):
+            plugin.upload(
+                video_file,
+                metadata={
+                    "format": "1080x1920",
+                    "duration_seconds": 9999.0,
+                },
+            )
+
+    def test_upload_dry_run_returns_sentinel(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        plugin_config["dry_run"] = True
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        with patch(
+            "reeln_tiktok_plugin.plugin.upload.upload_video"
+        ) as mock_upload:
+            url = plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+        assert url == "tiktok:dry_run"
+        mock_upload.assert_not_called()
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video")
+    def test_upload_file_upload_without_video_url(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        mock_upload.return_value = _SUCCESS_RESULT
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        url = plugin.upload(
+            video_file,
+            metadata={"format": "1080x1920", "description": "Check this out"},
+        )
+
+        assert url == "https://www.tiktok.com/@user/video/123"
+        mock_upload.assert_called_once()
+        kwargs = mock_upload.call_args.kwargs
+        assert kwargs["file_path"] == video_file
+        assert kwargs["caption"] == "Check this out"
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video_from_url")
+    def test_upload_pull_from_url_when_video_url_present(
+        self,
+        mock_pull: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        mock_pull.return_value = _SUCCESS_RESULT
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        plugin.upload(
+            video_file,
+            metadata={"format": "1080x1920", "video_url": _CDN_URL},
+        )
+
+        mock_pull.assert_called_once()
+        kwargs = mock_pull.call_args.kwargs
+        assert kwargs["video_url"] == _CDN_URL
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video")
+    def test_upload_error_propagates(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        mock_upload.side_effect = UploadError("API down")
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        with pytest.raises(UploadError, match="API down"):
+            plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video")
+    def test_upload_empty_share_url_returns_publish_id_sentinel(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        """When share_url is empty (e.g. inbox/drafts mode), fall back to
+        publish_id as a sentinel so publish_queue_item still records a URL."""
+        mock_upload.return_value = UploadResult(
+            publish_id="pub-inbox",
+            status="SEND_TO_USER_INBOX",
+            share_url="",
+        )
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        url = plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+        assert url == "tiktok:pub-inbox"
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video")
+    def test_upload_caption_from_template(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        mock_upload.return_value = _SUCCESS_RESULT
+        plugin_config["caption_template"] = "Watch {home_team} vs {away_team}"
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        plugin.upload(
+            video_file,
+            metadata={
+                "format": "1080x1920",
+                "home_team": "Eagles",
+                "away_team": "Hawks",
+            },
+        )
+
+        kwargs = mock_upload.call_args.kwargs
+        assert kwargs["caption"] == "Watch Eagles vs Hawks"
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video")
+    def test_upload_caption_from_game_info_fallback(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        mock_upload.return_value = _SUCCESS_RESULT
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        plugin.upload(
+            video_file,
+            metadata={
+                "format": "1080x1920",
+                "home_team": "Eagles",
+                "away_team": "Hawks",
+                "date": "2026-01-15",
+            },
+        )
+
+        kwargs = mock_upload.call_args.kwargs
+        # Hydrated game_info → _build_title("Eagles vs Hawks - 2026-01-15")
+        assert "Eagles" in kwargs["caption"]
+        assert "Hawks" in kwargs["caption"]
+
+    def test_upload_caption_empty_when_no_game_data(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+
+        with patch(
+            "reeln_tiktok_plugin.plugin.upload.upload_video",
+            return_value=_SUCCESS_RESULT,
+        ) as mock_upload:
+            plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+        # No description, no template, no game_info, no metadata team keys
+        kwargs = mock_upload.call_args.kwargs
+        # Empty caption falls back to empty string (no hydration possible)
+        assert isinstance(kwargs["caption"], str)
+
+    def test_upload_accepts_no_metadata(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        """metadata=None is valid per the Uploader protocol. Missing
+        format → defaults to landscape → upload_videos gate applies."""
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        plugin = TikTokPlugin(plugin_config)
+
+        # upload_videos not set → skipped
+        with pytest.raises(UploaderSkipped, match="upload_videos"):
+            plugin.upload(video_file)
+
+    def test_upload_hydrate_noop_when_game_info_already_set(
+        self,
+        plugin_config: dict[str, Any],
+    ) -> None:
+        plugin = TikTokPlugin(plugin_config)
+        existing = FakeGameInfo(home_team="X", away_team="Y")
+        plugin._game_info = existing
+        plugin._hydrate_game_info_from_metadata({"home_team": "Other"})
+        assert plugin._game_info is existing
+
+    def test_upload_hydrate_noop_when_metadata_empty(
+        self,
+        plugin_config: dict[str, Any],
+    ) -> None:
+        plugin = TikTokPlugin(plugin_config)
+        plugin._hydrate_game_info_from_metadata({})
+        assert plugin._game_info is None
+
+    def test_upload_invalid_format_defaults_to_landscape(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        plugin = TikTokPlugin(plugin_config)  # only upload_shorts set
+
+        with pytest.raises(UploaderSkipped, match="upload_videos"):
+            plugin.upload(video_file, metadata={"format": "invalid"})
+
+    def test_upload_format_with_x_but_non_numeric(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        """'WxH' literal (non-numeric) hits the ValueError branch in
+        _is_portrait_from_metadata, falling through to landscape default."""
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        plugin = TikTokPlugin(plugin_config)  # only upload_shorts set
+
+        with pytest.raises(UploaderSkipped, match="upload_videos"):
+            plugin.upload(video_file, metadata={"format": "WxH"})
+
+    @patch("reeln_tiktok_plugin.plugin.upload.upload_video")
+    def test_upload_caption_from_preset_game_info(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+    ) -> None:
+        """When _game_info is already set by a hook and no description or
+        template is provided, caption comes from _build_title(game_info)."""
+        mock_upload.return_value = _SUCCESS_RESULT
+        plugin = TikTokPlugin(plugin_config)
+        plugin._access_token = "test-token"
+        plugin._game_info = FakeGameInfo(
+            home_team="Preset", away_team="Team", date="2026-01-01"
+        )
+
+        plugin.upload(video_file, metadata={"format": "1080x1920"})
+
+        kwargs = mock_upload.call_args.kwargs
+        assert "Preset" in kwargs["caption"]
+        assert "Team" in kwargs["caption"]
+
+    def test_build_caption_from_empty_metadata_returns_empty(
+        self,
+        plugin_config: dict[str, Any],
+    ) -> None:
+        """Direct call: empty metadata → no description/template/game_info
+        → hydration early-returns → empty caption."""
+        plugin = TikTokPlugin(plugin_config)
+        assert plugin._game_info is None
+        assert plugin._build_caption_from_metadata({}) == ""
