@@ -127,6 +127,16 @@ class TestRegister:
 
 
 class TestOnGameInit:
+    def test_regenerate_image_only_skips(self) -> None:
+        """When regenerate_image_only is set, on_game_init returns immediately."""
+        plugin = TikTokPlugin()
+        context = HookContext(
+            hook=Hook.ON_GAME_INIT,
+            data={"game_info": FakeGameInfo(), "regenerate_image_only": True},
+        )
+        plugin.on_game_init(context)
+        assert plugin._game_info is None
+
     def test_caches_game_info(self) -> None:
         plugin = TikTokPlugin()
         gi = FakeGameInfo()
@@ -346,6 +356,24 @@ class TestOnPostRenderSuccess:
         assert context.shared["uploads"]["tiktok"]["shorts"] == [
             {"publish_id": "pub1", "share_url": "", "status": "SEND_TO_USER_INBOX"}
         ]
+
+    def test_upload_without_plan_dimensions(
+        self, plugin_config: dict[str, Any], video_file: Path
+    ) -> None:
+        """When plan has no width/height, format key is omitted from metadata."""
+        plugin_config["upload_videos"] = True
+        plugin = TikTokPlugin(plugin_config)
+        data: dict[str, Any] = {
+            "plan": FakePlan(width=None, height=None, output=video_file, filter_complex="overlay"),
+            "result": FakeResult(output=video_file),
+        }
+        context = HookContext(hook=Hook.POST_RENDER, data=data)
+        with patch(
+            "reeln_tiktok_plugin.plugin.upload.upload_video",
+            return_value=_UPLOAD_RESULT,
+        ):
+            plugin.on_post_render(context)
+        assert "videos" in context.shared["uploads"]["tiktok"]
 
     def test_landscape_upload_writes_videos(self, video_file: Path, plugin_config: dict[str, Any]) -> None:
         plugin_config["upload_videos"] = True

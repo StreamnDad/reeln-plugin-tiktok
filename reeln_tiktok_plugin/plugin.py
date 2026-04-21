@@ -15,6 +15,7 @@ from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
 from reeln_tiktok_plugin import auth, upload
+from reeln_tiktok_plugin.upload import CreatorInfo
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ class TikTokPlugin:
         self._config: dict[str, Any] = config or {}
         self._access_token: str | None = None
         self._game_info: object | None = None
-        self._creator_info: upload.CreatorInfo | None = None
+        self._creator_info: CreatorInfo | None = None
         # Most recent upload result, captured by upload() for
         # on_post_render to populate context.shared["uploads"].
         self._last_upload_result: upload.UploadResult | None = None
@@ -627,7 +628,7 @@ class TikTokPlugin:
 
         return self._access_token
 
-    def _ensure_creator_info(self, access_token: str) -> upload.CreatorInfo | None:
+    def _ensure_creator_info(self, access_token: str) -> CreatorInfo | None:
         """Return cached creator info, or query and cache it.
 
         Failures are non-fatal — returns ``None`` and logs a warning.
@@ -643,7 +644,7 @@ class TikTokPlugin:
 
         return self._creator_info
 
-    def _validate_privacy(self, privacy_level: str, creator: upload.CreatorInfo) -> str:
+    def _validate_privacy(self, privacy_level: str, creator: CreatorInfo) -> str:
         """Validate the configured privacy level against creator options.
 
         Falls back to the first available option if the configured level
